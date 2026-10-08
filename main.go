@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"bytes"
+	"sync"
 
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -14,6 +15,7 @@ import (
 	"github.com/ipfs/go-cid"
 )
 
+// -------------------- IDENTITY --------------------
 func resolvePDSEndpoint(ctx context.Context, didStr string) (string, error) {
 	// Parse string into a type-safe DID
 	did, err := syntax.ParseDID(didStr)
@@ -37,14 +39,101 @@ func resolvePDSEndpoint(ctx context.Context, didStr string) (string, error) {
 	return pdsEndpoint, nil
 }
 
-func main() {
-	testDIDstr := "did:plc:ylv5w5tfhnkzg2qfdxztd5yx"
+// -------------------- STATE MACHINE --------------------
+type RepoState int
 
-	ctx := context.Background()
+// Defining the states
+const (
+	StateNew RepoState = iota
+	StateBackfilling
+	StateSynced
+)
 
-	pdsEndpoint, err := resolvePDSEndpoint(ctx, testDIDstr)
+// Just for testing a local firehose
+type CommitEvent struct {
+	DID string
+	Rev string
+	Op  string
+}
+
+// State machine
+type RepoTracker struct {
+	did	   string
+	mu     sync.Mutex
+	state  RepoState
+	rev    string // latest rev we've processed; "" if none
+	buffer []CommitEvent
+}
+
+// To be called before "get repo"
+func (t *RepoTracker) BeginBackfill() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.state = StateBackfilling
+}
+
+// If there's an error, then we need to revert back to starting state
+func (t *RepoTracker) AbortBackfill() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.state = StateNew
+	t.buffer = nil
+}
+
+// FinishBackfill records the checkpoint rev, replays the buffer, and changes state to Synced
+func (t *RepoTracker) FinishBackfill(checkpointRev string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.rev = checkpointRev
+	for _, evt := range t.buffer {
+		t.applyLocked(evt)
+	}
+	t.buffer = nil
+	t.state = StateSynced
+}
+
+// ** assumes that Mutex is held
+func (t *RepoTracker) applyLocked(evt CommitEvent) {
+	// Since revs are lexicographically sorted, we can just use string comparison to determine if the event is new.
+	if evt.Rev <= t.rev {
+		fmt.Printf("skip  rev=%s (already covered, have %s)\n", evt.Rev, t.rev)
+		return
+	}
+	fmt.Printf("apply rev=%s op=%s\n", evt.Rev, evt.Op)
+	t.rev = evt.Rev
+}
+
+// HandleEvent is called for every live event for this repo.
+func (t *RepoTracker) HandleEvent(evt CommitEvent) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	switch t.state {
+	case StateBackfilling:
+		t.buffer = append(t.buffer, evt)
+	case StateSynced:
+		t.applyLocked(evt)
+	case StateNew:
+		// TODO: trigger a backfill here?
+	}
+}
+
+func (t *RepoTracker) Backfill(ctx context.Context) error {
+	// lock the mutex and open the buffer
+	t.BeginBackfill()
+
+	// this runs at the end of the code to return to a retryable state if needed
+	ok := false
+	defer func() {
+		if !ok {
+			t.AbortBackfill()
+		}
+	}()
+
+	pdsEndpoint, err := resolvePDSEndpoint(ctx, t.did)
 	if err != nil {
-		log.Fatalf("Error resolving PDS endpoint: %v", err)
+		return err
 	}
 
 	// Need to pass in pds endpoint so that xrpc client knows where to make request
@@ -53,33 +142,40 @@ func main() {
 	}
 
 	// Call get repo to initially backfill.
-	carBytes, err := comatproto.SyncGetRepo(ctx, xrpcClient, testDIDstr, "")
+	carBytes, err := comatproto.SyncGetRepo(ctx, xrpcClient, t.did, "")
 	if err != nil {
-		log.Fatalf("Failed to download car file: %v", err)
+		return fmt.Errorf("get repo: %w", err)
 	}
 
 	// Creates an in memory store to read the contents of the car file
 	r, err := repo.ReadRepoFromCar(ctx, bytes.NewReader(carBytes))
 	if err != nil {
-		log.Fatalf("failed to parse CAR: %v", err)
+		return fmt.Errorf("parsing car file: %w", err)
 	}
 
-	commit := r.SignedCommit()
-	log.Printf("repo DID: %s", commit.Did)
-	log.Printf("checkpoint rev: %s", commit.Rev)
+	checkpointRev := r.SignedCommit().Rev
 
-	// Walk the Merkle Search Tree and process every record
+	// Emit every record in the checkpoint.
 	count := 0
-	err = r.ForEach(ctx, "", func(path string, recordCID cid.Cid) error {
+	err = r.ForEach(ctx, "", func(path string, c cid.Cid) error {
 		count++
-		if count <= 5 {
-			log.Printf("record %d: %s -> %s", count, path, recordCID)
-		}
+		log.Printf("backfill record: %s -> %s", path, c)
 		return nil
 	})
 	if err != nil {
-		log.Fatalf("walking repo failed: %v", err)
+		return fmt.Errorf("walk repo: %w", err)
 	}
-	log.Printf("total records: %d", count)
+	log.Printf("backfilled %d records at rev %s", count, checkpointRev)
+
+	// Replay buffered events (skipping stale ones) and go live.
+	t.FinishBackfill(checkpointRev)
+	ok = true
+	return nil
+}
+
+func main() {
+	testDIDstr := "did:plc:ylv5w5tfhnkzg2qfdxztd5yx"
+
+	ctx := context.Background()
 
 }
