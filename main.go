@@ -6,6 +6,7 @@ import (
 	"log"
 	"bytes"
 	"sync"
+	"time"
 
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -16,14 +17,14 @@ import (
 )
 
 // -------------------- IDENTITY --------------------
-func resolvePDSEndpoint(ctx context.Context, didStr string) (string, error) {
+func ResolvePDSEndpoint(ctx context.Context, didStr string) (string, error) {
 	// Parse string into a type-safe DID
 	did, err := syntax.ParseDID(didStr)
 	if err != nil {
 		return "", fmt.Errorf("invalid DID string %q: %w", didStr, err)	
 	}
 
-	// Directories are an atproto convention to handle DID resolution and network related tasks
+	// Directories are used in atproto for network related tasks. Here using it for DID resolution.
 	dir := identity.DefaultDirectory()
 	ident, err := dir.LookupDID(ctx, did)
 	if err != nil {
@@ -87,14 +88,14 @@ func (t *RepoTracker) FinishBackfill(checkpointRev string) {
 
 	t.rev = checkpointRev
 	for _, evt := range t.buffer {
-		t.applyLocked(evt)
+		t.ApplyLocked(evt)
 	}
 	t.buffer = nil
 	t.state = StateSynced
 }
 
 // ** assumes that Mutex is held
-func (t *RepoTracker) applyLocked(evt CommitEvent) {
+func (t *RepoTracker) ApplyLocked(evt CommitEvent) {
 	// Since revs are lexicographically sorted, we can just use string comparison to determine if the event is new.
 	if evt.Rev <= t.rev {
 		fmt.Printf("skip  rev=%s (already covered, have %s)\n", evt.Rev, t.rev)
@@ -111,11 +112,14 @@ func (t *RepoTracker) HandleEvent(evt CommitEvent) {
 
 	switch t.state {
 	case StateBackfilling:
+		log.Printf("Added to buffer, state backfilling, evt=%+v", evt)
 		t.buffer = append(t.buffer, evt)
 	case StateSynced:
-		t.applyLocked(evt)
+		log.Printf("Directly handling because backfill complete %+v", evt)
+		t.ApplyLocked(evt)
 	case StateNew:
-		// TODO: trigger a backfill here?
+		log.Printf("Backfill hasn't started yet, ignoring %+v", evt)
+		// TODO: trigger a backfill here asynchronously
 	}
 }
 
@@ -131,7 +135,8 @@ func (t *RepoTracker) Backfill(ctx context.Context) error {
 		}
 	}()
 
-	pdsEndpoint, err := resolvePDSEndpoint(ctx, t.did)
+	// Find where the PDS is
+	pdsEndpoint, err := ResolvePDSEndpoint(ctx, t.did)
 	if err != nil {
 		return err
 	}
@@ -174,8 +179,22 @@ func (t *RepoTracker) Backfill(ctx context.Context) error {
 }
 
 func main() {
-	testDIDstr := "did:plc:ylv5w5tfhnkzg2qfdxztd5yx"
-
 	ctx := context.Background()
+	did := "did:plc:ylv5w5tfhnkzg2qfdxztd5yx"
+	t := &RepoTracker{did: did}
 
+	// Simulate firehose events arriving while the download is in flight.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		t.HandleEvent(CommitEvent{did, "3mxa36vcryf1z", "older than checkpoint"})
+		t.HandleEvent(CommitEvent{did, "3mxa36vcryf2r", "equal to checkpoint"})
+		t.HandleEvent(CommitEvent{did, "3mxa36vcryf2s", "newer than checkpoint"})
+	}()
+
+	if err := t.Backfill(ctx); err != nil {
+		log.Fatalf("backfill failed: %v", err)
+	}
+
+	// A live event after going synced.
+	t.HandleEvent(CommitEvent{did, "3mxa36vcryf3a", "live event"})
 }
