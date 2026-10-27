@@ -4,15 +4,23 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"bytes"
-	"sync"
+	"log/slog"
 	"time"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"bytes"
+	"os"
 
-	"github.com/bluesky-social/indigo/atproto/identity"
-	"github.com/bluesky-social/indigo/atproto/syntax"
-	"github.com/bluesky-social/indigo/xrpc"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
+	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/repo"
+	"github.com/bluesky-social/indigo/xrpc"
+	"github.com/bluesky-social/indigo/atproto/syntax"
+	"github.com/bluesky-social/indigo/events"
+	"github.com/bluesky-social/indigo/events/schedulers/sequential"
+	"github.com/gorilla/websocket"
 	"github.com/ipfs/go-cid"
 )
 
@@ -54,6 +62,7 @@ const (
 type CommitEvent struct {
 	DID string
 	Rev string
+	Since string
 	Op  string
 }
 
@@ -99,6 +108,12 @@ func (t *RepoTracker) ApplyLocked(evt CommitEvent) {
 	// Since revs are lexicographically sorted, we can just use string comparison to determine if the event is new.
 	if evt.Rev <= t.rev {
 		fmt.Printf("skip  rev=%s (already covered, have %s)\n", evt.Rev, t.rev)
+		return
+	}
+
+	// TODO: We're missing something somehow, so we should re backfill
+	if evt.Since != t.rev {
+		log.Printf("gap   rev=%s since=%s but we have %s, would need to re-backfill", evt.Rev, evt.Since, t.rev)
 		return
 	}
 	fmt.Printf("apply rev=%s op=%s\n", evt.Rev, evt.Op)
@@ -178,23 +193,69 @@ func (t *RepoTracker) Backfill(ctx context.Context) error {
 	return nil
 }
 
+// "https://host" -> "wss://host/xrpc/com.atproto.sync.subscribeRepos"
+func pdsStreamURL(pds string) (string, error) {
+	u, err := url.Parse(pds)
+	if err != nil {
+		return "", err
+	}
+	u.Scheme = "wss"
+	u.Path = "/xrpc/com.atproto.sync.subscribeRepos"
+	return u.String(), nil
+}
+
 func main() {
 	ctx := context.Background()
 	did := "did:plc:ylv5w5tfhnkzg2qfdxztd5yx"
 	t := &RepoTracker{did: did}
 
-	// Simulate firehose events arriving while the download is in flight.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		t.HandleEvent(CommitEvent{did, "3mxa36vcryf1z", "older than checkpoint"})
-		t.HandleEvent(CommitEvent{did, "3mxa36vcryf2r", "equal to checkpoint"})
-		t.HandleEvent(CommitEvent{did, "3mxa36vcryf2s", "newer than checkpoint"})
-	}()
-
-	if err := t.Backfill(ctx); err != nil {
-		log.Fatalf("backfill failed: %v", err)
+	pds, err := ResolvePDSEndpoint(ctx, did)
+	if err != nil {
+		log.Fatalf("resolve: %v", err)
 	}
 
-	// A live event after going synced.
-	t.HandleEvent(CommitEvent{did, "3mxa36vcryf3a", "live event"})
+	log.Println(pds)
+	wsURL, err := pdsStreamURL(pds)
+	if err != nil {
+		log.Fatalf("bad url: %v", err)
+	}
+
+	// 1. Connect FIRST so no event can slip past us.
+	con, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, http.Header{})
+	if err != nil {
+		log.Fatalf("dial: %v", err)
+	}
+	defer con.Close()
+	log.Printf("connected to %s", wsURL)
+
+	// 2. Backfill in the background. Events that arrive meanwhile get buffered.
+	go func() {
+		if err := t.Backfill(ctx); err != nil {
+			log.Printf("backfill failed: %v", err)
+		}
+	}()
+
+	// 3. Consume the stream (blocks).
+	rsc := &events.RepoStreamCallbacks{
+		RepoCommit: func(evt *comatproto.SyncSubscribeRepos_Commit) error {
+			if evt.Repo != did {
+				return nil
+			}
+			since := ""
+			if evt.Since != nil {
+				since = *evt.Since
+			}
+			ops := make([]string, 0, len(evt.Ops))
+			for _, op := range evt.Ops {
+				ops = append(ops, fmt.Sprintf("%s %s", op.Action, op.Path))
+			}
+			t.HandleEvent(CommitEvent{DID: evt.Repo, Rev: evt.Rev, Since: since, Op: strings.Join(ops, ", ")})
+			return nil
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	sched := sequential.NewScheduler("tap", rsc.EventHandler)
+	if err := events.HandleRepoStream(ctx, con, sched, logger); err != nil {
+		log.Fatalf("stream ended: %v", err)
+	}
 }
