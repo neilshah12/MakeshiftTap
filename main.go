@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
-	"time"
 	"net/http"
 	"net/url"
 	"strings"
@@ -69,6 +68,7 @@ type CommitEvent struct {
 // State machine
 type RepoTracker struct {
 	did	   string
+	pds	   string
 	mu     sync.Mutex
 	state  RepoState
 	rev    string // latest rev we've processed; "" if none
@@ -103,7 +103,7 @@ func (t *RepoTracker) FinishBackfill(checkpointRev string) {
 	t.state = StateSynced
 }
 
-// ** assumes that Mutex is held
+// ** Assumes that Mutex is held
 func (t *RepoTracker) ApplyLocked(evt CommitEvent) {
 	// Since revs are lexicographically sorted, we can just use string comparison to determine if the event is new.
 	if evt.Rev <= t.rev {
@@ -139,10 +139,10 @@ func (t *RepoTracker) HandleEvent(evt CommitEvent) {
 }
 
 func (t *RepoTracker) Backfill(ctx context.Context) error {
-	// lock the mutex and open the buffer
+	// Lock the mutex and open the buffer
 	t.BeginBackfill()
 
-	// this runs at the end of the code to return to a retryable state if needed
+	// This runs at the end of the code to return to a retryable state if needed
 	ok := false
 	defer func() {
 		if !ok {
@@ -150,15 +150,9 @@ func (t *RepoTracker) Backfill(ctx context.Context) error {
 		}
 	}()
 
-	// Find where the PDS is
-	pdsEndpoint, err := ResolvePDSEndpoint(ctx, t.did)
-	if err != nil {
-		return err
-	}
-
 	// Need to pass in pds endpoint so that xrpc client knows where to make request
 	xrpcClient := &xrpc.Client{
-		Host: pdsEndpoint,
+		Host: t.pds,
 	}
 
 	// Call get repo to initially backfill.
@@ -193,7 +187,9 @@ func (t *RepoTracker) Backfill(ctx context.Context) error {
 	return nil
 }
 
-// "https://host" -> "wss://host/xrpc/com.atproto.sync.subscribeRepos"
+// -------------------- LIVE SYNCING --------------------
+
+// Puts the pds host url in the websocket url format
 func pdsStreamURL(pds string) (string, error) {
 	u, err := url.Parse(pds)
 	if err != nil {
@@ -204,41 +200,34 @@ func pdsStreamURL(pds string) (string, error) {
 	return u.String(), nil
 }
 
-func main() {
-	ctx := context.Background()
-	did := "did:plc:ylv5w5tfhnkzg2qfdxztd5yx"
-	t := &RepoTracker{did: did}
-
-	pds, err := ResolvePDSEndpoint(ctx, did)
-	if err != nil {
-		log.Fatalf("resolve: %v", err)
-	}
-
-	log.Println(pds)
+func RunPDSStream(ctx context.Context, pds string, trackers map[string]*RepoTracker) error {
 	wsURL, err := pdsStreamURL(pds)
 	if err != nil {
-		log.Fatalf("bad url: %v", err)
+		return err
 	}
 
-	// 1. Connect FIRST so no event can slip past us.
+	// Connect to the stream first, so if an event comes while backfilling we don't miss it
 	con, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, http.Header{})
 	if err != nil {
-		log.Fatalf("dial: %v", err)
+		return fmt.Errorf("dial %s: %w", wsURL, err)
 	}
 	defer con.Close()
-	log.Printf("connected to %s", wsURL)
+	log.Printf("[%s] connected, tracking %d account(s)", pds, len(trackers))
 
-	// 2. Backfill in the background. Events that arrive meanwhile get buffered.
-	go func() {
-		if err := t.Backfill(ctx); err != nil {
-			log.Printf("backfill failed: %v", err)
-		}
-	}()
+	// Backfill every tracked account on this pds in a background goroutine
+	for _, t := range trackers {
+		go func(t *RepoTracker) {
+			if err := t.Backfill(ctx); err != nil {
+				log.Printf("backfill %s failed: %v", t.did, err)
+			}
+		}(t)
+	}
 
-	// 3. Consume the stream (blocks).
 	rsc := &events.RepoStreamCallbacks{
 		RepoCommit: func(evt *comatproto.SyncSubscribeRepos_Commit) error {
-			if evt.Repo != did {
+			t, ok := trackers[evt.Repo]
+			if !ok {
+				// someone else's post, ignore.
 				return nil
 			}
 			since := ""
@@ -253,9 +242,43 @@ func main() {
 			return nil
 		},
 	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	sched := sequential.NewScheduler("tap", rsc.EventHandler)
-	if err := events.HandleRepoStream(ctx, con, sched, logger); err != nil {
-		log.Fatalf("stream ended: %v", err)
+	sched := sequential.NewScheduler("tap-"+pds, rsc.EventHandler)
+	return events.HandleRepoStream(ctx, con, sched, logger)
+}
+
+func main() {
+	ctx := context.Background()
+
+	dids := []string{
+		"did:plc:ylv5w5tfhnkzg2qfdxztd5yx",
 	}
+
+	// Group trackers by PDS.
+	byPDS := map[string]map[string]*RepoTracker{}
+	for _, did := range dids {
+		pds, err := ResolvePDSEndpoint(ctx, did)
+		if err != nil {
+			log.Printf("skipping %s: %v", did, err)
+			continue
+		}
+		if byPDS[pds] == nil {
+			byPDS[pds] = map[string]*RepoTracker{}
+		}
+		byPDS[pds][did] = &RepoTracker{did: did, pds: pds}
+	}
+
+	// One connection per PDS.
+	var wg sync.WaitGroup
+	for pds, trackers := range byPDS {
+		wg.Add(1)
+		go func(pds string, trackers map[string]*RepoTracker) {
+			defer wg.Done()
+			if err := RunPDSStream(ctx, pds, trackers); err != nil {
+				log.Printf("[%s] stream ended: %v", pds, err)
+			}
+		}(pds, trackers)
+	}
+	wg.Wait()
 }
